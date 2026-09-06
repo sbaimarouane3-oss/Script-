@@ -150,13 +150,28 @@ def ssh_add(data):
     sshd_cfg = Path('/etc/ssh/sshd_config')
     backup = sshd_cfg.read_text() if sshd_cfg.exists() else ''
     if port != 22:
+        # OpenSSH does not allow a global Port directive inside a Match block.
+        # Insert the new Port before the first Match directive, rather than at EOF.
         lines = backup.splitlines()
-        if not any(re.match(r'^\s*Port\s+' + re.escape(str(port)) + r'\s*$', x) for x in lines):
-            sshd_cfg.write_text(backup.rstrip() + f'\nPort {port}\n')
+        has_port = any(re.match(r'^\s*Port\s+' + re.escape(str(port)) + r'\s*$', x) for x in lines)
+        if not has_port:
+            match_idx = next((i for i, x in enumerate(lines) if re.match(r'^\s*Match\b', x, re.I)), len(lines))
+            lines.insert(match_idx, f'Port {port}')
+            sshd_cfg.write_text('\n'.join(lines).rstrip() + '\n')
         rc, out = run('sshd -t')
         if rc != 0:
-            sshd_cfg.write_text(backup); print('[ERR] sshd config test failed:', out); return
-        run('systemctl restart ssh || systemctl restart sshd')
+            sshd_cfg.write_text(backup)
+            # Do not leave a newly-created account behind after a failed SSH setup.
+            run(f'userdel -r {q(user)}')
+            print('[ERR] sshd config test failed:', out)
+            return
+        rc, out = run('systemctl restart ssh || systemctl restart sshd')
+        if rc != 0:
+            sshd_cfg.write_text(backup)
+            run('systemctl restart ssh || systemctl restart sshd')
+            run(f'userdel -r {q(user)}')
+            print('[ERR] SSH service restart failed:', out)
+            return
 
     sid = f'ssh-{int(time.time())}'
     s = {'id': sid, 'protocol':'ssh', 'name':name, 'port':port, 'username':user,
