@@ -150,27 +150,29 @@ def ssh_add(data):
     sshd_cfg = Path('/etc/ssh/sshd_config')
     backup = sshd_cfg.read_text() if sshd_cfg.exists() else ''
     if port != 22:
-        # OpenSSH does not allow a global Port directive inside a Match block.
-        # Insert the new Port before the first Match directive, rather than at EOF.
         lines = backup.splitlines()
-        has_port = any(re.match(r'^\s*Port\s+' + re.escape(str(port)) + r'\s*$', x) for x in lines)
-        if not has_port:
-            match_idx = next((i for i, x in enumerate(lines) if re.match(r'^\s*Match\b', x, re.I)), len(lines))
-            lines.insert(match_idx, f'Port {port}')
-            sshd_cfg.write_text('\n'.join(lines).rstrip() + '\n')
+        # Global directives such as Port must appear before the first Match block.
+        first_match = next((i for i, line in enumerate(lines)
+                            if re.match(r'^\s*Match\b', line)), len(lines))
+        if not any(re.match(r'^\s*Port\s+' + re.escape(str(port)) + r'\s*$', x)
+                   for x in lines[:first_match]):
+            lines.insert(first_match, f'Port {port}')
+            sshd_cfg.write_text('\n'.join(lines) + '\n')
         rc, out = run('sshd -t')
         if rc != 0:
             sshd_cfg.write_text(backup)
-            # Do not leave a newly-created account behind after a failed SSH setup.
-            run(f'userdel -r {q(user)}')
-            print('[ERR] sshd config test failed:', out)
-            return
+            print('[ERR] sshd config test failed:', out); return
         rc, out = run('systemctl restart ssh || systemctl restart sshd')
         if rc != 0:
             sshd_cfg.write_text(backup)
             run('systemctl restart ssh || systemctl restart sshd')
-            run(f'userdel -r {q(user)}')
-            print('[ERR] SSH service restart failed:', out)
+            print('[ERR] SSH restart failed:', out); return
+        # Confirm sshd is really listening on the requested TCP port.
+        rc, out = run(f"ss -lntH | awk '$4 ~ /:{int(port)}$/ {{print $4}}'")
+        if rc != 0 or not out:
+            sshd_cfg.write_text(backup)
+            run('systemctl restart ssh || systemctl restart sshd')
+            print(f'[ERR] sshd is not listening on TCP port {port}; configuration rolled back.')
             return
 
     sid = f'ssh-{int(time.time())}'
