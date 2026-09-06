@@ -1,390 +1,359 @@
 #!/usr/bin/env python3
 """
-MR-UDP server daemon.
+MR-UDP v1 server - the missing counterpart to app's MrUdpClient.kt.
 
-Matches the wire protocol implemented by the Android client
-(app/src/main/java/com/sshproxy/vpn/MrUdpClient.kt) exactly:
+Wire protocol (must match MrUdpClient.kt exactly):
+  Frame (before encryption): type(1B) + id(int32 BE) + seq(int32 BE)
+                              + payloadLen(int32 BE) + payload
+  On the wire: nonce(12B) + AES-256-GCM(frame, key=SHA256(password), tag=16B)
 
-  - Transport : single UDP socket.
-  - Encryption: AES-256-GCM. Key = SHA-256(password). Each packet is
-                sent as  nonce(12 bytes) || ciphertext+tag.
-  - Plaintext frame (before encryption):
-        type   : 1 byte  (unsigned)
-        id     : 4 bytes (signed, big-endian)   -- stream / request id
-        seq    : 4 bytes (signed, big-endian)   -- sequence number
-        len    : 4 bytes (unsigned, big-endian) -- payload length (informational)
-        payload: <len> bytes
-  - Message types:
-        HELLO=1, HELLO_OK=2, OPEN=3, OPEN_OK=4, DATA=5,
-        ACK=6, CLOSE=7, UDP=8, PING=9
-  - HELLO payload   : utf8(username) + utf8(password)   (each length-prefixed,
-                       2-byte big-endian length + utf8 bytes)
-  - OPEN payload    : utf8(host) + raw 2-byte big-endian port
-  - OPEN_OK payload : single byte, 1 = accepted, 0 = failed
-  - DATA/ACK        : payload is the raw chunk (<=1100 bytes) for DATA,
-                       empty for ACK. Every DATA received must be ACKed
-                       with the same id/seq.
-  - CLOSE           : closes/removes the stream with that id.
-  - UDP payload (client->server) : utf8(host) + raw 2-byte port + raw data
-    UDP payload (server->client) : raw response data only (no host/port,
-                       the client already knows it from its own request).
-  - PING            : echoed back as-is (id=0, same seq).
+Opcodes: HELLO=1 HELLO_OK=2 OPEN=3 OPEN_OK=4 DATA=5 ACK=6 CLOSE=7 UDP=8 PING=9
 
-Deployed by mrudp_manager.py as a systemd service:
-    ExecStart=/usr/bin/python3 /root/mr_udp_server.py --port $MR_PORT
-    EnvironmentFile provides MR_USER and MR_PASS.
+Env vars (written by mrvpn_manager.py to /opt/mr-vpn-manager/env/<id>.env
+and loaded by its systemd unit):
+    MR_USER  - expected username (informational check only)
+    MR_PASS  - shared secret; AES key = SHA256(MR_PASS). MUST match the
+               password entered in the app's MR-UDP form.
+    MR_PORT  - UDP port to listen on
 
-Requirements:
-    pip3 install cryptography --break-system-packages
+Usage:
+    python3 mr_udp_server.py --port 4433 --user mrudp --pass 'secret'
+    (or just rely on MR_USER / MR_PASS / MR_PORT from the environment,
+    which is how mrvpn_manager.py's systemd unit invokes it)
+
+Requires: pip3 install --break-system-packages cryptography
 """
-
 import argparse
 import asyncio
+import hashlib
 import os
+import socket
 import struct
 import sys
 import time
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.exceptions import InvalidTag
 except ImportError:
-    print("[FATAL] Missing dependency. Run: pip3 install cryptography --break-system-packages",
-          file=sys.stderr)
+    print("ERROR: missing dependency. Run:\n"
+          "  pip3 install --break-system-packages cryptography", file=sys.stderr)
     sys.exit(1)
 
-import hashlib
-
-# ---- protocol constants (must mirror MrUdpClient.kt) ----------------------
 HELLO, HELLO_OK, OPEN, OPEN_OK, DATA, ACK, CLOSE, UDP, PING = range(1, 10)
-
 MAX_PAYLOAD = 1100
-ACK_TIMEOUT = 1.8          # seconds, mirrors ACK_TIMEOUT_MS
+ACK_TIMEOUT = 1.8
 MAX_RETRIES = 5
-SESSION_IDLE_TIMEOUT = 300  # drop a client session after 5 min of silence
-UDP_ASSOC_TIMEOUT = 5       # seconds to wait for a UDP reply from the target
-
-log_prefix = "[mr-udp]"
-
-
-def log(msg: str) -> None:
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} {log_prefix} {msg}", flush=True)
+SESSION_IDLE_TIMEOUT = 300
+HEADER_FMT = ">biii"          # type, id, seq, payloadLen  (13 bytes)
+HEADER_LEN = struct.calcsize(HEADER_FMT)
 
 
-def read_utf8(buf: bytes, off: int):
-    length = struct.unpack(">H", buf[off:off + 2])[0]
-    off += 2
-    s = buf[off:off + length].decode("utf-8", errors="replace")
-    off += length
-    return s, off
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def write_utf8(s: str) -> bytes:
-    b = s.encode("utf-8")
-    return struct.pack(">H", len(b)) + b
+class Framer:
+    """AES-256-GCM using key = SHA256(password), matching the client exactly."""
 
+    def __init__(self, password: str):
+        key = hashlib.sha256(password.encode("utf-8")).digest()
+        self.aead = AESGCM(key)
 
-def encode_frame(type_: int, id_: int, seq: int, payload: bytes) -> bytes:
-    return struct.pack(">BiiI", type_, id_, seq, len(payload)) + payload
+    def encrypt(self, plain: bytes) -> bytes:
+        nonce = os.urandom(12)
+        return nonce + self.aead.encrypt(nonce, plain, None)
 
-
-def decode_frame(plain: bytes):
-    if len(plain) < 13:
-        return None
-    type_ = plain[0]
-    id_, seq = struct.unpack(">ii", plain[1:9])
-    payload = plain[13:]
-    return type_, id_, seq, payload
-
-
-class StreamState:
-    __slots__ = ("id", "writer", "send_seq", "recv_seq", "ack_waiters", "closed")
-
-    def __init__(self, id_: int, writer: asyncio.StreamWriter):
-        self.id = id_
-        self.writer = writer
-        self.send_seq = 0
-        self.recv_seq = 0
-        self.ack_waiters = {}
-        self.closed = False
-
-
-class ClientSession:
-    def __init__(self, addr):
-        self.addr = addr
-        self.authenticated = False
-        self.streams: dict[int, StreamState] = {}
-        self.last_seen = time.monotonic()
-
-    def touch(self):
-        self.last_seen = time.monotonic()
-
-
-class MrUdpServer(asyncio.DatagramProtocol):
-    def __init__(self, username: str, password: str):
-        self.username = username
-        self.key = hashlib.sha256(password.encode("utf-8")).digest()
-        self.aead = AESGCM(self.key)
-        self.password = password
-        self.transport: asyncio.DatagramTransport | None = None
-        self.sessions: dict[tuple, ClientSession] = {}
-
-    # -- asyncio.DatagramProtocol -------------------------------------------------
-    def connection_made(self, transport):
-        self.transport = transport
-        log(f"listening (username='{self.username}')")
-
-    def error_received(self, exc):
-        log(f"WARN: socket error: {exc}")
-
-    def datagram_received(self, data: bytes, addr):
-        asyncio.create_task(self._handle(data, addr))
-
-    def connection_lost(self, exc):
-        log(f"socket closed: {exc}")
-
-    # -- crypto ---------------------------------------------------------------
     def decrypt(self, data: bytes):
         if len(data) < 12 + 16:
             return None
         nonce, ct = data[:12], data[12:]
         try:
             return self.aead.decrypt(nonce, ct, None)
-        except InvalidTag:
-            return None
         except Exception:
             return None
 
-    def send_packet(self, addr, type_: int, id_: int, seq: int, payload: bytes):
-        plain = encode_frame(type_, id_, seq, payload)
-        nonce = os.urandom(12)
-        ct = self.aead.encrypt(nonce, plain, None)
-        try:
-            self.transport.sendto(nonce + ct, addr)
-        except Exception as e:
-            log(f"WARN: sendto failed: {e}")
 
-    # -- dispatch ---------------------------------------------------------------
-    async def _handle(self, data: bytes, addr):
-        plain = self.decrypt(data)
+def pack_frame(t, sid, seq, payload=b""):
+    return struct.pack(HEADER_FMT, t, sid, seq, len(payload)) + payload
+
+
+def unpack_frame(plain):
+    if len(plain) < HEADER_LEN:
+        return None
+    t, sid, seq, _plen = struct.unpack(HEADER_FMT, plain[:HEADER_LEN])
+    # Client's own decoder ignores the length field and just takes the
+    # rest of the packet as payload - mirror that for compatibility.
+    return t, sid, seq, plain[HEADER_LEN:]
+
+
+def read_utf(buf: bytes, off: int):
+    ln = (buf[off] << 8) | buf[off + 1]
+    off += 2
+    return buf[off:off + ln].decode("utf-8", "replace"), off + ln
+
+
+class Stream:
+    """One proxied TCP connection multiplexed inside the tunnel."""
+
+    def __init__(self, session, sid, host, port):
+        self.session = session
+        self.id = sid
+        self.host = host
+        self.port = port
+        self.reader = None
+        self.writer = None
+        self.up_expected_seq = 0        # next DATA seq expected FROM client
+        self.down_seq = 0               # our own outgoing DATA seq counter
+        self.down_ack_event = asyncio.Event()
+        self.down_last_ack = -1
+        self.closed = False
+        self.last_active = time.time()
+
+    def touch(self):
+        self.last_active = time.time()
+
+    async def connect(self) -> bool:
+        try:
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.host, self.port), timeout=8)
+            return True
+        except Exception as e:
+            log(f"stream {self.id}: connect to {self.host}:{self.port} failed: {e}")
+            return False
+
+    async def pump_remote_to_client(self):
+        try:
+            while not self.closed:
+                data = await self.reader.read(MAX_PAYLOAD)
+                if not data:
+                    break
+                for i in range(0, len(data), MAX_PAYLOAD):
+                    await self.send_reliable(data[i:i + MAX_PAYLOAD])
+        except Exception:
+            pass
+        finally:
+            await self.close(notify=True)
+
+    async def send_reliable(self, chunk: bytes):
+        seq = self.down_seq
+        self.down_seq += 1
+        for _ in range(MAX_RETRIES):
+            if self.closed:
+                return
+            self.down_ack_event.clear()
+            self.session.send_frame(DATA, self.id, seq, chunk)
+            try:
+                await asyncio.wait_for(self.down_ack_event.wait(), ACK_TIMEOUT)
+                if self.down_last_ack >= seq:
+                    return
+            except asyncio.TimeoutError:
+                continue
+        await self.close(notify=True)
+
+    def on_ack(self, seq):
+        if seq > self.down_last_ack:
+            self.down_last_ack = seq
+        self.down_ack_event.set()
+
+    def on_data(self, seq, payload):
+        self.touch()
+        if seq == self.up_expected_seq:
+            self.up_expected_seq += 1
+            if self.writer:
+                try:
+                    self.writer.write(payload)
+                except Exception:
+                    pass
+        # Ack every received seq (even duplicates) - mirrors the client.
+        self.session.send_frame(ACK, self.id, seq, b"")
+
+    async def close(self, notify=False):
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            if self.writer:
+                self.writer.close()
+        except Exception:
+            pass
+        if notify:
+            self.session.send_frame(CLOSE, self.id, 0, b"")
+        self.session.streams.pop(self.id, None)
+
+
+class Session:
+    """One authenticated client, keyed by its source (ip, port)."""
+
+    def __init__(self, server, addr):
+        self.server = server
+        self.addr = addr
+        self.authenticated = False
+        self.streams = {}
+        self.last_active = time.time()
+
+    def touch(self):
+        self.last_active = time.time()
+
+    def send_frame(self, t, sid, seq, payload):
+        enc = self.server.framer.encrypt(pack_frame(t, sid, seq, payload))
+        self.server.transport.sendto(enc, self.addr)
+
+    async def handle_hello(self, payload):
+        try:
+            off = 0
+            user, off = read_utf(payload, off)
+            _pw, off = read_utf(payload, off)
+        except Exception:
+            return
+        # Packet only decrypted successfully because the password (=AES key)
+        # was already correct, so this username check is just a courtesy.
+        if self.server.expected_user and user != self.server.expected_user:
+            log(f"{self.addr}: HELLO with unexpected username '{user}' - rejected")
+            return
+        self.authenticated = True
+        self.touch()
+        log(f"{self.addr}: authenticated as '{user}'")
+        self.send_frame(HELLO_OK, 0, 0, b"")
+
+    async def handle_open(self, sid, payload):
+        try:
+            off = 0
+            host, off = read_utf(payload, off)
+            port = (payload[off] << 8) | payload[off + 1]
+        except Exception:
+            self.send_frame(OPEN_OK, sid, 0, b"\x00")
+            return
+        stream = Stream(self, sid, host, port)
+        self.streams[sid] = stream
+        ok = await stream.connect()
+        self.send_frame(OPEN_OK, sid, 0, bytes([1 if ok else 0]))
+        if ok:
+            asyncio.ensure_future(stream.pump_remote_to_client())
+        else:
+            self.streams.pop(sid, None)
+
+    def handle_data(self, sid, seq, payload):
+        stream = self.streams.get(sid)
+        if stream:
+            stream.on_data(seq, payload)
+        else:
+            # Unknown/closed stream - ack anyway so the client stops retrying.
+            self.send_frame(ACK, sid, seq, b"")
+
+    def handle_ack(self, sid, seq):
+        stream = self.streams.get(sid)
+        if stream:
+            stream.on_ack(seq)
+
+    async def handle_close(self, sid):
+        stream = self.streams.pop(sid, None)
+        if stream:
+            await stream.close(notify=False)
+
+    async def handle_udp(self, req_id, payload):
+        try:
+            off = 0
+            host, off = read_utf(payload, off)
+            port = (payload[off] << 8) | payload[off + 1]
+            off += 2
+            data = payload[off:]
+        except Exception:
+            return
+        loop = asyncio.get_event_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        try:
+            sock.sendto(data, (host, port))
+            resp = await asyncio.wait_for(loop.sock_recv(sock, 65535), timeout=8)
+            self.send_frame(UDP, req_id, 0, resp)
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            log(f"UDP relay to {host}:{port} failed: {e}")
+        finally:
+            sock.close()
+
+    def handle_ping(self, seq):
+        self.send_frame(PING, 0, seq, b"")
+
+
+class MrUdpServerProtocol(asyncio.DatagramProtocol):
+    def __init__(self, framer, expected_user):
+        self.framer = framer
+        self.expected_user = expected_user
+        self.sessions = {}
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        plain = self.framer.decrypt(data)
         if plain is None:
-            return  # wrong password or corrupt packet -> silently drop
-        frame = decode_frame(plain)
+            return  # wrong password or corrupt packet - drop silently
+        frame = unpack_frame(plain)
         if frame is None:
             return
-        type_, id_, seq, payload = frame
+        t, sid, seq, payload = frame
 
         session = self.sessions.get(addr)
         if session is None:
-            session = ClientSession(addr)
+            if t != HELLO:
+                return  # first packet from a new address must be HELLO
+            session = Session(self, addr)
             self.sessions[addr] = session
+
         session.touch()
-
-        if type_ == HELLO:
-            await self._handle_hello(session, payload)
+        if t == HELLO:
+            asyncio.ensure_future(session.handle_hello(payload))
+        elif not session.authenticated:
             return
+        elif t == OPEN:
+            asyncio.ensure_future(session.handle_open(sid, payload))
+        elif t == DATA:
+            session.handle_data(sid, seq, payload)
+        elif t == ACK:
+            session.handle_ack(sid, seq)
+        elif t == CLOSE:
+            asyncio.ensure_future(session.handle_close(sid))
+        elif t == UDP:
+            asyncio.ensure_future(session.handle_udp(sid, payload))
+        elif t == PING:
+            session.handle_ping(seq)
 
-        if not session.authenticated:
-            return  # ignore everything until a valid HELLO arrives
-
-        if type_ == OPEN:
-            await self._handle_open(session, id_, payload)
-        elif type_ == DATA:
-            await self._handle_data(session, id_, seq, payload)
-        elif type_ == ACK:
-            self._handle_ack(session, id_, seq)
-        elif type_ == CLOSE:
-            self._handle_close(session, id_)
-        elif type_ == UDP:
-            asyncio.create_task(self._handle_udp(session, id_, payload))
-        elif type_ == PING:
-            self.send_packet(session.addr, PING, 0, seq, b"")
-
-    async def _handle_hello(self, session: ClientSession, payload: bytes):
-        try:
-            user, off = read_utf8(payload, 0)
-            pw, _ = read_utf8(payload, off)
-        except Exception:
-            return
-        if user == self.username and pw == self.password:
-            session.authenticated = True
-            self.send_packet(session.addr, HELLO_OK, 0, 0, b"")
-            log(f"client {session.addr[0]}:{session.addr[1]} authenticated")
-        else:
-            log(f"WARN: bad credentials from {session.addr[0]}:{session.addr[1]} (user='{user}')")
-
-    async def _handle_open(self, session: ClientSession, id_: int, payload: bytes):
-        try:
-            host, off = read_utf8(payload, 0)
-            port = struct.unpack(">H", payload[off:off + 2])[0]
-        except Exception:
-            self.send_packet(session.addr, OPEN_OK, id_, 0, b"\x00")
-            return
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=10
-            )
-        except Exception as e:
-            log(f"OPEN failed -> {host}:{port} ({e})")
-            self.send_packet(session.addr, OPEN_OK, id_, 0, b"\x00")
-            return
-        stream = StreamState(id_, writer)
-        session.streams[id_] = stream
-        self.send_packet(session.addr, OPEN_OK, id_, 0, b"\x01")
-        asyncio.create_task(self._pump_target_to_client(session, stream, reader))
-
-    async def _handle_data(self, session: ClientSession, id_: int, seq: int, payload: bytes):
-        stream = session.streams.get(id_)
-        if stream is not None and not stream.closed:
-            if seq == stream.recv_seq:
-                try:
-                    stream.writer.write(payload)
-                    await stream.writer.drain()
-                    stream.recv_seq += 1
-                except Exception:
-                    self._close_stream(session, stream)
-        # ack regardless, mirrors the client's own receive loop behaviour
-        self.send_packet(session.addr, ACK, id_, seq, b"")
-
-    def _handle_ack(self, session: ClientSession, id_: int, seq: int):
-        stream = session.streams.get(id_)
-        if stream is None:
-            return
-        fut = stream.ack_waiters.pop(seq, None)
-        if fut is not None and not fut.done():
-            fut.set_result(True)
-
-    def _handle_close(self, session: ClientSession, id_: int):
-        stream = session.streams.pop(id_, None)
-        if stream is not None:
-            self._close_stream(session, stream, notify=False)
-
-    def _close_stream(self, session: ClientSession, stream: StreamState, notify: bool = True):
-        if stream.closed:
-            return
-        stream.closed = True
-        try:
-            stream.writer.close()
-        except Exception:
-            pass
-        for fut in stream.ack_waiters.values():
-            if not fut.done():
-                fut.set_result(False)
-        stream.ack_waiters.clear()
-        session.streams.pop(stream.id, None)
-        if notify:
-            self.send_packet(session.addr, CLOSE, stream.id, 0, b"")
-
-    async def _pump_target_to_client(self, session: ClientSession, stream: StreamState, reader: asyncio.StreamReader):
-        try:
-            while not stream.closed:
-                chunk = await reader.read(MAX_PAYLOAD)
-                if not chunk:
-                    break
-                ok = await self._send_reliable(session, stream, chunk)
-                if not ok:
-                    break
-        except Exception:
-            pass
-        finally:
-            self._close_stream(session, stream, notify=True)
-
-    async def _send_reliable(self, session: ClientSession, stream: StreamState, data: bytes) -> bool:
-        seq = stream.send_seq
-        stream.send_seq += 1
-        loop = asyncio.get_event_loop()
-        for _ in range(MAX_RETRIES):
-            if stream.closed:
-                return False
-            fut = loop.create_future()
-            stream.ack_waiters[seq] = fut
-            self.send_packet(session.addr, DATA, stream.id, seq, data)
-            try:
-                result = await asyncio.wait_for(fut, timeout=ACK_TIMEOUT)
-                if result:
-                    return True
-            except asyncio.TimeoutError:
-                stream.ack_waiters.pop(seq, None)
-                continue
-        return False
-
-    async def _handle_udp(self, session: ClientSession, id_: int, payload: bytes):
-        try:
-            host, off = read_utf8(payload, 0)
-            port = struct.unpack(">H", payload[off:off + 2])[0]
-            data = payload[off + 2:]
-        except Exception:
-            return
-        resp = await self._udp_roundtrip(host, port, data, UDP_ASSOC_TIMEOUT)
-        if resp is not None:
-            self.send_packet(session.addr, UDP, id_, 0, resp)
-
-    @staticmethod
-    async def _udp_roundtrip(host: str, port: int, data: bytes, timeout: float):
-        loop = asyncio.get_event_loop()
-        fut = loop.create_future()
-
-        class _Proto(asyncio.DatagramProtocol):
-            def connection_made(self, transport):
-                transport.sendto(data)
-
-            def datagram_received(self, resp_data, _addr):
-                if not fut.done():
-                    fut.set_result(resp_data)
-
-            def error_received(self, exc):
-                if not fut.done():
-                    fut.set_exception(exc)
-
-        try:
-            transport, _ = await loop.create_datagram_endpoint(
-                _Proto, remote_addr=(host, port)
-            )
-        except Exception:
-            return None
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        except Exception:
-            return None
-        finally:
-            transport.close()
-
-    async def reap_idle_sessions(self):
+    async def reap_idle(self):
         while True:
             await asyncio.sleep(30)
-            now = time.monotonic()
-            dead = [addr for addr, s in self.sessions.items()
-                    if now - s.last_seen > SESSION_IDLE_TIMEOUT]
-            for addr in dead:
-                session = self.sessions.pop(addr, None)
-                if session:
-                    for stream in list(session.streams.values()):
-                        self._close_stream(session, stream, notify=False)
-                    log(f"dropped idle session {addr[0]}:{addr[1]}")
+            now = time.time()
+            for addr, s in list(self.sessions.items()):
+                if now - s.last_active > SESSION_IDLE_TIMEOUT:
+                    for st in list(s.streams.values()):
+                        asyncio.ensure_future(st.close(notify=False))
+                    self.sessions.pop(addr, None)
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="MR-UDP server")
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--bind", default="0.0.0.0")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="MR-UDP v1 server")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("MR_PORT", "4433")))
+    ap.add_argument("--user", default=os.environ.get("MR_USER", ""))
+    ap.add_argument("--pass", dest="password", default=os.environ.get("MR_PASS", ""))
+    ap.add_argument("--bind", default="0.0.0.0")
+    args = ap.parse_args()
 
-    username = os.environ.get("MR_USER")
-    password = os.environ.get("MR_PASS")
-    if not username or not password:
-        log("FATAL: MR_USER / MR_PASS environment variables are required")
+    if not args.password:
+        log("ERROR: no password set (env MR_PASS or --pass). Refusing to start.")
         sys.exit(1)
 
+    framer = Framer(args.password)
     loop = asyncio.get_event_loop()
-    server = MrUdpServer(username, password)
-    transport, _ = await loop.create_datagram_endpoint(
-        lambda: server, local_addr=(args.bind, args.port)
+    transport, protocol = await loop.create_datagram_endpoint(
+        lambda: MrUdpServerProtocol(framer, args.user or None),
+        local_addr=(args.bind, args.port),
     )
-    log(f"MR-UDP server started on {args.bind}:{args.port}")
-    asyncio.create_task(server.reap_idle_sessions())
+    log(f"MR-UDP server listening on {args.bind}:{args.port} (user={args.user or '<any>'})")
+    asyncio.ensure_future(protocol.reap_idle())
     try:
-        await asyncio.Event().wait()
+        await asyncio.Future()  # run forever
     finally:
         transport.close()
 
