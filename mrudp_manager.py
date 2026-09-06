@@ -56,19 +56,43 @@ def box(title, rows, color=C.CYAN):
         print(f"{color}|{C.RESET} {row[:w-4]:<{w-4}} {color}|{C.RESET}")
     print(f"{color}+{'-'*(w-2)}+{C.RESET}")
 
+## Plain ASCII (7-bit) letter font, 5 rows tall. Uses only '#' and spaces so
+## it renders identically on every terminal/font, unlike heavy Unicode block
+## glyphs which some SSH/terminal apps render broken or misaligned.
+_FONT = {
+    "M": ["#   #","## ##","# # #","#   #","#   #"],
+    "R": ["#### ","#   #","#### ","#  # ","#   #"],
+    "V": ["#   #","#   #","#   #"," # # ","  #  "],
+    "P": ["#### ","#   #","#### ","#    ","#    "],
+    "N": ["#   #","##  #","# # #","#  ##","#   #"],
+    "T": ["#####","  #  ","  #  ","  #  ","  #  "],
+    "U": ["#   #","#   #","#   #","#   #"," ### "],
+    "L": ["#    ","#    ","#    ","#    ","#####"],
+    "E": ["#####","#    ","#### ","#    ","#####"],
+    " ": ["   ","   ","   ","   ","   "],
+}
+
+def _build_banner_art(text, gap=1):
+    glyphs=[_FONT[ch] for ch in text]
+    rows=[]
+    for r in range(5):
+        rows.append((" "*gap).join(g[r] for g in glyphs))
+    return rows
+
 def banner():
     print()
-    art=[
-        "███╗   ███╗██████╗       ██╗   ██╗██████╗ ",
-        "████╗ ████║██╔══██╗      ██║   ██║██╔══██╗",
-        "██╔████╔██║██████╔╝█████╗██║   ██║██║  ██║",
-        "██║╚██╔╝██║██╔══██╗╚════╝╚██╗ ██╔╝██║  ██║",
-        "██║ ╚═╝ ██║██║  ██║       ╚████╔╝ ██████╔╝",
-        "╚═╝     ╚═╝╚═╝  ╚═╝        ╚═══╝  ╚═════╝ ",
-    ]
-    for x in art:
-        print(C.CYAN+C.BOLD+x+C.RESET)
-    print(C.MAGENTA+C.BOLD+"             MR VPN TUNNEL  -  MR-UDP MANAGER"+C.RESET)
+    title="MR VPN TUNNEL"
+    art=_build_banner_art(title)
+    art_width=len(art[0]) if art else 0
+    if art_width<=width():
+        for row in art:
+            print(C.CYAN+C.BOLD+row+C.RESET)
+        print(C.MAGENTA+C.BOLD+"MR-UDP MANAGER"+C.RESET)
+    else:
+        # Terminal too narrow for the big letters - fall back to plain text
+        # instead of letting it wrap and look broken.
+        print(C.CYAN+C.BOLD+title+C.RESET)
+        print(C.MAGENTA+C.BOLD+"MR-UDP MANAGER"+C.RESET)
     line("=", C.MAGENTA)
 
 def ensure():
