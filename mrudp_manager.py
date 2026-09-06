@@ -138,6 +138,25 @@ def ask_int(prompt, default, minimum=1, maximum=65535):
             pass
         print(f"{C.RED}[ERROR] Invalid number ({minimum}-{maximum}).{C.RESET}")
 
+PORT_RANGE_TOKENS = {"1-65535","all","full","any","*","0"}
+
+def ask_port(default=443):
+    """Ask for the server port. Accepts a single port 1-65535, or one of
+    PORT_RANGE_TOKENS to mean 'forward every port (1-65535) to this server'
+    via iptables. Returns (port:int, is_range:bool)."""
+    while True:
+        v=input(f"{C.YELLOW}>{C.RESET} {C.CYAN}Port{C.RESET} {C.DIM}[{default}]{C.RESET} "
+                f"{C.DIM}(or 'all' for every port 1-65535){C.RESET}: ").strip()
+        if not v: return default, False
+        if v.lower() in PORT_RANGE_TOKENS:
+            return None, True
+        try:
+            n=int(v)
+            if 1<=n<=65535: return n, False
+        except ValueError:
+            pass
+        print(f"{C.RED}[ERROR] Invalid number (1-65535), or type 'all' for every port.{C.RESET}")
+
 def ask_choice(prompt, options, default=None):
     """options: list of (key, label). Returns the chosen key."""
     for k,label in options:
@@ -189,6 +208,46 @@ def gen_uuid():
 
 def port_in_use(data, port, exclude_id=None):
     return any(int(s.get("port",0))==port and s["id"]!=exclude_id for s in data)
+
+# ---- optional "forward every port" support (iptables REDIRECT) -----------
+# A protocol still binds to ONE real port (s["port"]); when the user asks
+# for "all ports", every incoming port 1-65535 is redirected to that real
+# port so clients can connect on any port. Admin SSH (22) is always
+# excluded first so the box itself never gets locked out.
+
+IPTABLES = shutil.which("iptables") or "/usr/sbin/iptables"
+ADMIN_SSH_PORT = 22
+
+def _iptables_rule_exists(args):
+    return run([IPTABLES,"-t","nat","-C","PREROUTING"]+args, True).returncode==0
+
+def persist_iptables():
+    if shutil.which("netfilter-persistent"):
+        run(["netfilter-persistent","save"], True)
+    elif Path("/etc/iptables").is_dir():
+        run(["sh","-c","iptables-save > /etc/iptables/rules.v4 2>/dev/null"], True)
+
+def add_port_range_forward(s):
+    real=int(s["port"]); tag=f"mrvpn-{s['id']}"
+    for proto in ("tcp","udp"):
+        guard=["-p",proto,"--dport",str(ADMIN_SSH_PORT),"-m","comment","--comment",tag+"-guard","-j","RETURN"]
+        if not _iptables_rule_exists(guard):
+            run([IPTABLES,"-t","nat","-I","PREROUTING","1"]+guard)
+        rule=["-p",proto,"--dport","1:65535","-m","comment","--comment",tag,"-j","REDIRECT","--to-port",str(real)]
+        if not _iptables_rule_exists(rule):
+            run([IPTABLES,"-t","nat","-A","PREROUTING"]+rule)
+    persist_iptables()
+
+def remove_port_range_forward(s):
+    real=int(s["port"]); tag=f"mrvpn-{s['id']}"
+    for proto in ("tcp","udp"):
+        rule=["-p",proto,"--dport","1:65535","-m","comment","--comment",tag,"-j","REDIRECT","--to-port",str(real)]
+        while _iptables_rule_exists(rule):
+            run([IPTABLES,"-t","nat","-D","PREROUTING"]+rule, True)
+        guard=["-p",proto,"--dport",str(ADMIN_SSH_PORT),"-m","comment","--comment",tag+"-guard","-j","RETURN"]
+        while _iptables_rule_exists(guard):
+            run([IPTABLES,"-t","nat","-D","PREROUTING"]+guard, True)
+    persist_iptables()
 
 # ---- shared Linux-account helpers (used by SSH and SSH+WebSocket) --------
 
@@ -984,7 +1043,8 @@ def print_summary(s, title="SERVER SUMMARY"):
         f"{C.WHITE}Protocol{C.RESET}      : {backend_for(s).label}",
         f"{C.WHITE}VPS IP{C.RESET}        : {s.get('vps_ip') or 'not set'}",
         f"{C.WHITE}Domain{C.RESET}        : {s.get('dns', {}).get('hostname') or 'none'}",
-        f"{C.WHITE}Port{C.RESET}          : {s['port']}",
+        f"{C.WHITE}Port{C.RESET}          : {s['port']}"
+        + (f"  {C.YELLOW}(all ports 1-65535 forwarded here){C.RESET}" if s.get("port_range") else ""),
     ]
     rows += backend_for(s).summary_rows(s)
     rows += [
@@ -1014,7 +1074,11 @@ def add_server(data):
     sid=valid_id(name)
     if any(x["id"]==sid for x in data):
         print(C.RED+"[ERROR] This name already exists."+C.RESET); input("Press Enter..."); return
-    port=ask_int("Port",443,1,65535)
+    port,port_range=ask_port(443)
+    if port_range:
+        print(C.YELLOW+"[INFO] Every port (1-65535) will be forwarded to this server's real port."+C.RESET)
+        print(C.YELLOW+"       Admin SSH (port 22) is always excluded so you don't get locked out."+C.RESET)
+        port=ask_int("Real port this server actually listens on",443,1,65535)
     if port_in_use(data, port):
         print(C.RED+"[ERROR] This port is already used by another server. Choose a different port."+C.RESET)
         input("Press Enter..."); return
@@ -1024,11 +1088,14 @@ def add_server(data):
     exp=datetime.now(timezone.utc)+timedelta(days=days)
     s={
         "id":sid,"protocol":proto_key,"name":name,"vps_ip":vps_ip,"port":port,
+        "port_range":port_range,
         "created":datetime.now(timezone.utc).isoformat(),"expires":exp.isoformat(),
         "dns":dns,
         "cfg":cfg
     }
     backend.provision(s)
+    if port_range:
+        add_port_range_forward(s)
     data.append(s); save(data)
     if yes("Start the server now?",True):
         backend.start(s)
@@ -1051,8 +1118,9 @@ def list_servers(data):
         st,col=status(s)
         exp=datetime.fromisoformat(s["expires"]).astimezone()
         proto=backend_for(s).key
+        pdisp=f"{s['port']}*" if s.get("port_range") else str(s['port'])
         rows.append(f"{C.WHITE}{i:>2}{C.RESET}  {C.BOLD}{s['name'][:16]:<16}{C.RESET} "
-                    f"{proto:<11} {s['port']:<6} {col}{st:<8}{C.RESET}  "
+                    f"{proto:<11} {pdisp:<6} {col}{st:<8}{C.RESET}  "
                     f"{exp.strftime('%Y-%m-%d %H:%M')}")
     box("SERVER LIST",rows,C.BLUE)
     input("Press Enter...")
@@ -1062,7 +1130,8 @@ def choose(data, title="Select a server"):
         print(C.YELLOW+"No servers found."+C.RESET); return None
     for i,s in enumerate(data,1):
         st,_=status(s)
-        print(f"  {C.CYAN}{i}{C.RESET}) {s['name']}  [{backend_for(s).key}]  [{st}]  port:{s['port']}")
+        pdisp=f"{s['port']} (all ports)" if s.get("port_range") else s['port']
+        print(f"  {C.CYAN}{i}{C.RESET}) {s['name']}  [{backend_for(s).key}]  [{st}]  port:{pdisp}")
     v=input(f"{C.YELLOW}>{C.RESET} {title} [0=back]: ").strip()
     try: n=int(v)
     except ValueError: return None
@@ -1141,6 +1210,8 @@ def delete_server(data):
     s=choose(data,"Select the server to delete")
     if not s:return
     if not yes(f"Are you sure you want to permanently delete {s['name']}?",False): return
+    if s.get("port_range"):
+        remove_port_range_forward(s)
     backend_for(s).deprovision(s)
     data.remove(s); save(data)
     print(C.GREEN+"[OK] Server and its local data deleted."+C.RESET)
