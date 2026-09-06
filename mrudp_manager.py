@@ -389,57 +389,116 @@ WantedBy=multi-user.target
     def logs(self, s):
         subprocess.run(["journalctl","-u",svc_name('ss',s['id']),"-n","80","-f"])
 
-# ---- VLESS / Xray ------------------------------------------------------
+# ---- Xray-core: VMess / VLESS / Trojan ---------------------------------
+# One backend, one systemd unit family, three selectable inner protocols
+# plus tcp/ws/grpc transport and optional TLS - covers every case the app's
+# XrayConfigParser understands (vmess://, vless://, trojan://, or raw JSON).
 
-class VlessBackend:
-    key="vless"; label="VLESS / V2Ray (Xray-core)"
+XRAY_INNER = [("1","vmess"),("2","vless"),("3","trojan")]
+XRAY_NETWORK = [("1","tcp"),("2","ws"),("3","grpc")]
+
+class XrayBackend:
+    key="xray"; label="VMess / VLESS / Trojan (Xray-core)"
 
     def add_fields(self, data, port):
         if not shutil.which("xray") and not Path(XRAY_BIN).exists():
             print(C.YELLOW+"[WARN] xray binary not found on PATH - install Xray-core first."+C.RESET)
-        client_id=ask("UUID", gen_uuid())
-        network=ask_choice("Transport", [("1","tcp"),("2","ws")], default="1")
-        network="tcp" if network=="1" else "ws"
-        ws_path=""
-        if network=="ws":
-            ws_path=ask("WebSocket path","/vless")
-        tls=yes("Enable TLS (requires an existing certificate)?",False)
+        inner=dict(XRAY_INNER)[ask_choice("Inner protocol", XRAY_INNER, default="2")]
+
+        if inner=="trojan":
+            secret=ask("Password", gen_password())
+            alter_id=0
+        else:
+            secret=ask("UUID", gen_uuid())
+            alter_id=ask_int("AlterId (VMess only, 0 = modern/no legacy auth)",0,0,255) if inner=="vmess" else 0
+
+        network=dict(XRAY_NETWORK)[ask_choice("Transport", XRAY_NETWORK, default="2")]
+        path=""
+        if network in ("ws","grpc"):
+            path=ask("Path / gRPC service name", f"/{inner}")
+
+        tls=yes("Report TLS to the client?",True)
+        fronted=False
         domain=""
         if tls:
-            domain=ask("Domain (certificate must already exist via certbot)")
-        return {"uuid":client_id,"network":network,"ws_path":ws_path,"tls":tls,"domain":domain}
+            fronted=yes("Is TLS terminated in front of Xray (Nginx/Cloudflare/CDN)?",True)
+            if not fronted:
+                domain=ask("Domain (certificate must already exist via certbot)")
+        sni=ask("SNI / Host header (domain the app will dial)","")
+        allow_insecure=yes("Allow insecure certificate on the client?",True) if tls else False
+
+        return {
+            "inner":inner,"secret":secret,"alter_id":alter_id,"network":network,
+            "path":path,"tls":tls,"fronted":fronted,"domain":domain,
+            "sni":sni,"allow_insecure":allow_insecure
+        }
 
     def cfg_path(self, s):
-        return CFG_DIR/f"{svc_name('vless',s['id'])}.json"
+        return CFG_DIR/f"{svc_name('xray',s['id'])}.json"
 
-    def provision(self, s):
+    def client_json_path(self, s):
+        return CFG_DIR/f"{svc_name('xray',s['id'])}.client.json"
+
+    def _stream_settings(self, s, for_inbound):
         cfg=s["cfg"]
         stream={"network":cfg["network"]}
+        host=cfg["sni"] or s.get("vps_ip","")
         if cfg["network"]=="ws":
-            stream["wsSettings"]={"path":cfg["ws_path"] or "/vless"}
-        if cfg["tls"] and cfg["domain"]:
-            stream["security"]="tls"
+            stream["wsSettings"]={"headers":{"Host":host},"path":cfg["path"] or f"/{cfg['inner']}"}
+        elif cfg["network"]=="grpc":
+            stream["grpcSettings"]={"serviceName":cfg["path"] or cfg["inner"]}
+
+        if not cfg["tls"]:
+            stream["security"]="none"
+            return stream
+
+        stream["security"]="tls"
+        if for_inbound and not cfg["fronted"] and cfg["domain"]:
+            # Xray itself terminates TLS with a real certificate.
             stream["tlsSettings"]={"certificates":[{
                 "certificateFile":f"/etc/letsencrypt/live/{cfg['domain']}/fullchain.pem",
                 "keyFile":f"/etc/letsencrypt/live/{cfg['domain']}/privkey.pem"
             }]}
-        else:
+        elif for_inbound and cfg["fronted"]:
+            # A reverse proxy / CDN in front already terminates TLS,
+            # so Xray itself listens in plain mode.
             stream["security"]="none"
+        else:
+            # Client side: just report the SNI + allowInsecure the app expects.
+            stream["tlsSettings"]={"allowInsecure":cfg["allow_insecure"],"serverName":host}
+        return stream
+
+    def _inbound_settings(self, s):
+        cfg=s["cfg"]
+        if cfg["inner"]=="vmess":
+            return {"clients":[{"id":cfg["secret"],"alterId":cfg["alter_id"],"level":8}]}
+        if cfg["inner"]=="vless":
+            return {"clients":[{"id":cfg["secret"],"level":8}],"decryption":"none"}
+        return {"clients":[{"password":cfg["secret"],"level":8}]}  # trojan
+
+    def provision(self, s):
+        cfg=s["cfg"]
         conf={
             "inbounds":[{
                 "port":s["port"],
-                "protocol":"vless",
-                "settings":{"clients":[{"id":cfg["uuid"],"level":0}],"decryption":"none"},
-                "streamSettings":stream
+                "protocol":cfg["inner"],
+                "settings":self._inbound_settings(s),
+                "streamSettings":self._stream_settings(s, for_inbound=True)
             }],
             "outbounds":[{"protocol":"freedom"}]
         }
         path=self.cfg_path(s)
         path.write_text(json.dumps(conf,indent=2),encoding="utf-8")
         os.chmod(path,0o600)
-        unit=SYSTEMD_DIR/(svc_name('vless',s['id'])+".service")
+
+        client=self.build_client_json(s)
+        cpath=self.client_json_path(s)
+        cpath.write_text(json.dumps(client,indent=2),encoding="utf-8")
+        os.chmod(cpath,0o600)
+
+        unit=SYSTEMD_DIR/(svc_name('xray',s['id'])+".service")
         unit.write_text(f"""[Unit]
-Description=MR VPN TUNNEL - VLESS {s['name']}
+Description=MR VPN TUNNEL - {cfg['inner'].upper()} {s['name']}
 After=network-online.target
 Wants=network-online.target
 
@@ -457,42 +516,80 @@ WantedBy=multi-user.target
         os.chmod(unit,0o644)
         run(["systemctl","daemon-reload"],True)
 
+    def build_client_json(self, s):
+        """Client-import JSON in the exact shape the app's Xray JSON
+        importer expects (outbounds[0].protocol/settings/streamSettings/tag)."""
+        cfg=s["cfg"]
+        address=cfg["sni"] or s.get("vps_ip","")
+        inner=cfg["inner"]
+
+        if inner=="trojan":
+            settings={"servers":[{"address":address,"port":s["port"],"password":cfg["secret"]}]}
+        else:
+            user={"id":cfg["secret"],"level":8}
+            if inner=="vmess":
+                user.update({"alterId":cfg["alter_id"],"security":"auto"})
+            else:  # vless
+                user["encryption"]="none"
+            settings={"vnext":[{"address":address,"port":s["port"],"users":[user]}]}
+
+        return {
+            "inbounds":[],
+            "outbounds":[{
+                "mux":{"enabled":False},
+                "protocol":inner,
+                "settings":settings,
+                "streamSettings":self._stream_settings(s, for_inbound=False),
+                "tag":inner.upper()
+            }],
+            "policy":{"levels":{"8":{"handshake":4,"connIdle":300,"uplinkOnly":1,"downlinkOnly":1}}}
+        }
+
     def deprovision(self, s):
-        run(["systemctl","disable","--now",svc_name('vless',s['id'])],True)
-        (SYSTEMD_DIR/(svc_name('vless',s['id'])+".service")).unlink(missing_ok=True)
+        run(["systemctl","disable","--now",svc_name('xray',s['id'])],True)
+        (SYSTEMD_DIR/(svc_name('xray',s['id'])+".service")).unlink(missing_ok=True)
         self.cfg_path(s).unlink(missing_ok=True)
+        self.client_json_path(s).unlink(missing_ok=True)
         run(["systemctl","daemon-reload"],True)
 
     def start(self, s):
-        return run(["systemctl","enable","--now",svc_name('vless',s['id'])])
+        return run(["systemctl","enable","--now",svc_name('xray',s['id'])])
 
     def stop(self, s):
-        return run(["systemctl","disable","--now",svc_name('vless',s['id'])],True)
+        return run(["systemctl","disable","--now",svc_name('xray',s['id'])],True)
 
     def restart(self, s):
-        return run(["systemctl","restart",svc_name('vless',s['id'])])
+        return run(["systemctl","restart",svc_name('xray',s['id'])])
 
     def status(self, s):
-        r=run(["systemctl","is-active",svc_name('vless',s['id'])],True)
+        r=run(["systemctl","is-active",svc_name('xray',s['id'])],True)
         return "RUNNING" if r.stdout.strip()=="active" else "STOPPED"
 
     def summary_rows(self, s):
         cfg=s["cfg"]
+        secret_label="Password" if cfg["inner"]=="trojan" else "UUID"
         rows=[
-            f"{C.WHITE}UUID{C.RESET}          : {cfg['uuid']}",
+            f"{C.WHITE}Inner Protocol{C.RESET}: {cfg['inner'].upper()}",
+            f"{C.WHITE}{secret_label:<14}{C.RESET}: {cfg['secret']}",
             f"{C.WHITE}Transport{C.RESET}     : {cfg['network']}",
         ]
-        if cfg["network"]=="ws":
-            rows.append(f"{C.WHITE}WS Path{C.RESET}       : {cfg['ws_path']}")
-        rows.append(f"{C.WHITE}TLS{C.RESET}           : {'yes ('+cfg['domain']+')' if cfg['tls'] else 'no'}")
+        if cfg["network"] in ("ws","grpc"):
+            rows.append(f"{C.WHITE}Path/Service{C.RESET}  : {cfg['path']}")
+        tls_desc="no"
+        if cfg["tls"]:
+            tls_desc="yes (fronted by reverse proxy/CDN)" if cfg["fronted"] else f"yes ({cfg['domain']})"
+        rows.append(f"{C.WHITE}TLS{C.RESET}           : {tls_desc}")
+        if cfg["sni"]:
+            rows.append(f"{C.WHITE}SNI/Host{C.RESET}      : {cfg['sni']}")
         rows.append(f"{C.WHITE}Config File{C.RESET}   : {self.cfg_path(s)}")
-        rows.append(f"{C.WHITE}Service Unit{C.RESET}  : {svc_name('vless',s['id'])}.service")
+        rows.append(f"{C.WHITE}Client JSON{C.RESET}   : {self.client_json_path(s)}")
+        rows.append(f"{C.WHITE}Service Unit{C.RESET}  : {svc_name('xray',s['id'])}.service")
         return rows
 
     def logs(self, s):
-        subprocess.run(["journalctl","-u",svc_name('vless',s['id']),"-n","80","-f"])
+        subprocess.run(["journalctl","-u",svc_name('xray',s['id']),"-n","80","-f"])
 
-BACKENDS = {b.key: b for b in (MrUdpBackend(), SshBackend(), ShadowsocksBackend(), VlessBackend())}
+BACKENDS = {b.key: b for b in (MrUdpBackend(), SshBackend(), ShadowsocksBackend(), XrayBackend())}
 PROTOCOL_MENU = [(str(i+1), b.label) for i,b in enumerate(BACKENDS.values())]
 PROTOCOL_KEYS = list(BACKENDS.keys())
 
@@ -574,6 +671,10 @@ def add_server(data):
     print(C.GREEN+"[OK] Server added successfully."+C.RESET)
     print()
     print_summary(s, title="NEW SERVER")
+    if hasattr(backend, "build_client_json"):
+        print()
+        box("CLIENT IMPORT JSON (paste into the app)", [], C.YELLOW)
+        print(json.dumps(backend.build_client_json(s), indent=2))
     input("Press Enter to continue...")
 
 def list_servers(data):
@@ -695,7 +796,12 @@ def details(data):
     clear(); banner()
     s=choose(data,"Select a server")
     if not s:return
+    backend=backend_for(s)
     print_summary(s, title="SERVER DETAILS")
+    if hasattr(backend, "build_client_json") and yes("Show client import JSON?",False):
+        print()
+        box("CLIENT IMPORT JSON (paste into the app)", [], C.YELLOW)
+        print(json.dumps(backend.build_client_json(s), indent=2))
     input("Press Enter...")
 
 def main():
