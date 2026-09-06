@@ -1,0 +1,3 @@
+curl -fsSL "https://raw.githubusercontent.com/sbaimarouane3-oss/Script-/refs/heads/main/mrudp_manager.py" -o /root/mrudp_manager.py
+chmod +x /root/mrudp_manager.py
+python3 /root/mrudp_manager.py
