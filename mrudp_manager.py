@@ -26,6 +26,8 @@ import subprocess
 import sys
 import time
 import uuid
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -278,6 +280,142 @@ def ensure_ssh_ws_proxy_script():
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     SSH_WS_PROXY_SCRIPT.write_text(SSH_WS_PROXY_SRC, encoding="utf-8")
     os.chmod(SSH_WS_PROXY_SCRIPT, 0o755)
+
+# --------------------------------------------------------------------------
+# optional DNS helpers
+# --------------------------------------------------------------------------
+# DuckDNS provides free subdomains (for example: myserver.duckdns.org).
+# Cloudflare manages DNS for domains already added to a Cloudflare account.
+# Tokens are kept in the local environment/config only; they are not printed.
+
+def dns_http_get(url, params):
+    query = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f"{url}?{query}", headers={"User-Agent": "MR-VPN-TUNNEL-DNS/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.read().decode("utf-8", errors="replace").strip()
+
+def configure_dns(vps_ip):
+    print()
+    box("OPTIONAL DNS / DOMAIN", [
+        "Create or update a DNS name pointing to this VPS.",
+        "DNS is optional; choose 3 to keep the VPS IP only."
+    ], C.BLUE)
+
+    choice = ask_choice(
+        "DNS provider",
+        [
+            ("1", "DuckDNS - free subdomain (*.duckdns.org)"),
+            ("2", "Cloudflare - existing domain in your Cloudflare account"),
+            ("3", "No DNS - use VPS IP only"),
+        ],
+        default="3"
+    )
+
+    if choice == "3":
+        return {"provider": "none", "hostname": ""}
+
+    try:
+        if choice == "1":
+            token = ask("DuckDNS token", secret=True)
+            hostname = ask("DuckDNS subdomain (without .duckdns.org)")
+            hostname = hostname.strip().lower().replace(".duckdns.org", "")
+            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname):
+                print(C.RED + "[ERROR] Invalid DuckDNS subdomain." + C.RESET)
+                return {"provider": "none", "hostname": ""}
+
+            result = dns_http_get(
+                "https://www.duckdns.org/update",
+                {"domains": hostname, "token": token, "ip": vps_ip}
+            )
+            if result != "OK":
+                print(C.RED + f"[ERROR] DuckDNS update failed: {result}" + C.RESET)
+                return {"provider": "none", "hostname": ""}
+
+            fqdn = f"{hostname}.duckdns.org"
+            print(C.GREEN + f"[OK] DNS updated: {fqdn} -> {vps_ip}" + C.RESET)
+            return {"provider": "duckdns", "hostname": fqdn}
+
+        # Cloudflare
+        api_token = ask("Cloudflare API Token", secret=True)
+        zone = ask("Cloudflare zone (example.com)")
+        hostname = ask("Hostname (example: vpn)")
+        zone = zone.strip().lower().rstrip(".")
+        hostname = hostname.strip().lower().rstrip(".")
+
+        if hostname in ("", "@"):
+            fqdn = zone
+            record_name = zone
+        elif hostname.endswith("." + zone):
+            fqdn = hostname
+            record_name = hostname
+        else:
+            fqdn = f"{hostname}.{zone}"
+            record_name = fqdn
+
+        # Get the zone ID.
+        zone_req = urllib.request.Request(
+            "https://api.cloudflare.com/client/v4/zones?" +
+            urllib.parse.urlencode({"name": zone, "status": "active"}),
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json",
+                     "User-Agent": "MR-VPN-TUNNEL-DNS/1.0"}
+        )
+        with urllib.request.urlopen(zone_req, timeout=10) as r:
+            zone_data = json.loads(r.read().decode("utf-8"))
+
+        if not zone_data.get("success") or not zone_data.get("result"):
+            print(C.RED + "[ERROR] Cloudflare zone not found or token has no access." + C.RESET)
+            return {"provider": "none", "hostname": ""}
+
+        zone_id = zone_data["result"][0]["id"]
+
+        # Find an existing A record.
+        record_req = urllib.request.Request(
+            "https://api.cloudflare.com/client/v4/zones/" + zone_id + "/dns_records?" +
+            urllib.parse.urlencode({"type": "A", "name": record_name}),
+            headers={"Authorization": f"Bearer {api_token}", "Content-Type": "application/json",
+                     "User-Agent": "MR-VPN-TUNNEL-DNS/1.0"}
+        )
+        with urllib.request.urlopen(record_req, timeout=10) as r:
+            record_data = json.loads(r.read().decode("utf-8"))
+
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "MR-VPN-TUNNEL-DNS/1.0"
+        }
+        payload = json.dumps({
+            "type": "A",
+            "name": record_name,
+            "content": vps_ip,
+            "ttl": 300,
+            "proxied": False
+        }).encode("utf-8")
+
+        if record_data.get("result"):
+            record_id = record_data["result"][0]["id"]
+            req = urllib.request.Request(
+                f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}",
+                data=payload, method="PUT", headers=headers
+            )
+        else:
+            req = urllib.request.Request(
+                f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records",
+                data=payload, method="POST", headers=headers
+            )
+
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = json.loads(r.read().decode("utf-8"))
+
+        if not result.get("success"):
+            print(C.RED + "[ERROR] Cloudflare DNS update failed." + C.RESET)
+            return {"provider": "none", "hostname": ""}
+
+        print(C.GREEN + f"[OK] DNS updated: {fqdn} -> {vps_ip}" + C.RESET)
+        return {"provider": "cloudflare", "hostname": fqdn}
+
+    except Exception as e:
+        print(C.RED + f"[ERROR] DNS setup failed: {e}" + C.RESET)
+        return {"provider": "none", "hostname": ""}
 
 # --------------------------------------------------------------------------
 # protocol backends
@@ -810,6 +948,8 @@ PROTOCOL_MENU = [(str(i+1), b.label) for i,b in enumerate(BACKENDS.values())]
 PROTOCOL_KEYS = list(BACKENDS.keys())
 
 def backend_for(s):
+    if "dns" not in s:
+        s["dns"] = {"provider": "none", "hostname": ""}
     return BACKENDS[s["protocol"]]
 
 # --------------------------------------------------------------------------
@@ -837,6 +977,7 @@ def print_summary(s, title="SERVER SUMMARY"):
         f"{C.WHITE}Server ID{C.RESET}     : {s['id']}",
         f"{C.WHITE}Protocol{C.RESET}      : {backend_for(s).label}",
         f"{C.WHITE}VPS IP{C.RESET}        : {s.get('vps_ip') or 'not set'}",
+        f"{C.WHITE}Domain{C.RESET}        : {s.get('dns', {}).get('hostname') or 'none'}",
         f"{C.WHITE}Port{C.RESET}          : {s['port']}",
     ]
     rows += backend_for(s).summary_rows(s)
@@ -862,6 +1003,7 @@ def add_server(data):
 
     detected=detect_ip()
     vps_ip=ask("VPS IP", detected or None)
+    dns=configure_dns(vps_ip)
     name=ask("Server name")
     sid=valid_id(name)
     if any(x["id"]==sid for x in data):
@@ -878,6 +1020,7 @@ def add_server(data):
     s={
         "id":sid,"protocol":proto_key,"name":name,"vps_ip":vps_ip,"port":port,
         "created":datetime.now(timezone.utc).isoformat(),"expires":exp.isoformat(),
+        "dns":dns,
         "cfg":cfg
     }
     backend.provision(s)
