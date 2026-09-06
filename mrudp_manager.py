@@ -34,6 +34,8 @@ BASE = Path("/opt/mr-vpn-manager")
 DB = BASE / "servers.json"
 CFG_DIR = BASE / "config"
 ENV_DIR = BASE / "env"
+BIN_DIR = BASE / "bin"
+SSH_WS_PROXY_SCRIPT = BIN_DIR / "ssh_ws_proxy.py"
 SYSTEMD_DIR = Path("/etc/systemd/system")
 MR_UDP_SERVER_SCRIPT = Path("/root/mr_udp_server.py")
 SS_BIN = shutil.which("ss-server") or "/usr/bin/ss-server"
@@ -94,7 +96,7 @@ def banner():
     line("=", C.MAGENTA)
 
 def ensure():
-    for d in (BASE, CFG_DIR, ENV_DIR):
+    for d in (BASE, CFG_DIR, ENV_DIR, BIN_DIR):
         d.mkdir(parents=True, exist_ok=True)
     if not DB.exists():
         DB.write_text("[]", encoding="utf-8")
@@ -185,6 +187,97 @@ def gen_uuid():
 
 def port_in_use(data, port, exclude_id=None):
     return any(int(s.get("port",0))==port and s["id"]!=exclude_id for s in data)
+
+# ---- shared Linux-account helpers (used by SSH and SSH+WebSocket) --------
+
+def create_account(username, password):
+    run(["useradd","-M","-N","-s","/usr/sbin/nologin",username])
+    subprocess.run(["chpasswd"],input=f"{username}:{password}\n",text=True)
+    run(["usermod","-U",username],True)
+
+def delete_account(username):
+    run(["userdel","-r",username],True)
+
+def lock_account(username):
+    run(["usermod","-L",username],True)
+
+def unlock_account(username):
+    run(["usermod","-U",username],True)
+
+def account_status(username):
+    r=run(["passwd","-S",username],True)
+    out=r.stdout.strip().split()
+    state=out[1] if len(out)>1 else "?"
+    return "STOPPED" if state=="L" else "RUNNING"
+
+# ---- shared SSH+WebSocket front proxy -------------------------------------
+# A tiny, dependency-free TCP proxy: it reads the client's initial HTTP/WS
+# -looking request (the app's "payload"), ignores it, sends back a canned
+# HTTP response, then relays raw bytes to the real sshd - so SSH traffic
+# rides inside what looks like a plain WebSocket/HTTP connection.
+
+SSH_WS_PROXY_SRC = '''#!/usr/bin/env python3
+"""Minimal HTTP/WebSocket-front TCP proxy for SSH-over-WebSocket tunnels."""
+import argparse, asyncio
+
+async def pipe(reader, writer):
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try: writer.close()
+        except Exception: pass
+
+async def handle(client_reader, client_writer, target_host, target_port, response):
+    try:
+        try:
+            await asyncio.wait_for(client_reader.readuntil(b"\\r\\n\\r\\n"), timeout=5)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError):
+            pass
+        client_writer.write(response)
+        await client_writer.drain()
+        target_reader, target_writer = await asyncio.open_connection(target_host, target_port)
+        await asyncio.gather(
+            pipe(client_reader, target_writer),
+            pipe(target_reader, client_writer),
+        )
+    except Exception:
+        pass
+    finally:
+        try: client_writer.close()
+        except Exception: pass
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--listen", required=True, help="host:port to listen on")
+    ap.add_argument("--target", required=True, help="host:port to forward to, e.g. 127.0.0.1:22")
+    ap.add_argument("--response-file", required=True, help="file with the raw bytes to send back after the handshake")
+    args = ap.parse_args()
+    with open(args.response_file, "rb") as f:
+        response = f.read()
+    lhost, lport = args.listen.rsplit(":", 1)
+    thost, tport = args.target.rsplit(":", 1)
+    server = await asyncio.start_server(
+        lambda r, w: handle(r, w, thost, int(tport), response),
+        lhost or "0.0.0.0", int(lport)
+    )
+    async with server:
+        await server.serve_forever()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+'''
+
+def ensure_ssh_ws_proxy_script():
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    SSH_WS_PROXY_SCRIPT.write_text(SSH_WS_PROXY_SRC, encoding="utf-8")
+    os.chmod(SSH_WS_PROXY_SCRIPT, 0o755)
 
 # --------------------------------------------------------------------------
 # protocol backends
@@ -281,27 +374,22 @@ class SshBackend:
 
     def provision(self, s):
         cfg=s["cfg"]
-        run(["useradd","-M","-N","-s","/usr/sbin/nologin",cfg["username"]])
-        p=subprocess.run(["chpasswd"],input=f"{cfg['username']}:{cfg['password']}\n",text=True)
-        run(["usermod","-U",cfg["username"]],True)  # ensure unlocked
+        create_account(cfg["username"], cfg["password"])
 
     def deprovision(self, s):
-        run(["userdel","-r",s["cfg"]["username"]],True)
+        delete_account(s["cfg"]["username"])
 
     def start(self, s):
-        return run(["usermod","-U",s["cfg"]["username"]],True)
+        return unlock_account(s["cfg"]["username"])
 
     def stop(self, s):
-        return run(["usermod","-L",s["cfg"]["username"]],True)
+        return lock_account(s["cfg"]["username"])
 
     def restart(self, s):
         return self.start(s)
 
     def status(self, s):
-        r=run(["passwd","-S",s["cfg"]["username"]],True)
-        out=r.stdout.strip().split()
-        state=out[1] if len(out)>1 else "?"
-        return "STOPPED" if state=="L" else "RUNNING"
+        return account_status(s["cfg"]["username"])
 
     def summary_rows(self, s):
         cfg=s["cfg"]
@@ -313,6 +401,91 @@ class SshBackend:
 
     def logs(self, s):
         subprocess.run(["journalctl","-u","ssh","-n","80","-f"])
+
+# ---- SSH + WebSocket (payload/CDN front) ----------------------------------
+# A real SSH account (same as above) PLUS a small proxy in front of it that
+# speaks just enough HTTP/WebSocket to satisfy the app's "payload" handshake
+# before becoming a transparent pipe into sshd. This is what lets SSH ride
+# through a WS/CDN front the way the app's SSH-Payload / SSH-TLS-Payload
+# modes expect on the client side.
+
+class SshWsBackend:
+    key="sshws"; label="SSH + WebSocket (payload/CDN front)"
+
+    def add_fields(self, data, port):
+        username=ask("Username", "mru_"+"".join(random.choices(string.ascii_lowercase+string.digits,k=5)))
+        password=ask("Password", gen_password(), secret=True)
+        local_port=ask_int("Local sshd port already running on this VPS",22,1,65535)
+        response=ask("Handshake response (use [crlf] for newlines)",
+                      "HTTP/1.1 101 Switching Protocols[crlf][crlf]")
+        return {"username":username,"password":password,"local_port":local_port,"response":response}
+
+    def response_path(self, s):
+        return CFG_DIR/f"{svc_name('sshws',s['id'])}.response"
+
+    def provision(self, s):
+        cfg=s["cfg"]
+        create_account(cfg["username"], cfg["password"])
+        ensure_ssh_ws_proxy_script()
+        rpath=self.response_path(s)
+        rpath.write_text(cfg["response"].replace("[crlf]","\r\n"), encoding="utf-8")
+        os.chmod(rpath,0o600)
+        unit=SYSTEMD_DIR/(svc_name('sshws',s['id'])+".service")
+        unit.write_text(f"""[Unit]
+Description=MR VPN TUNNEL - SSH WebSocket {s['name']}
+After=network-online.target sshd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 {SSH_WS_PROXY_SCRIPT} --listen 0.0.0.0:{s['port']} --target 127.0.0.1:{cfg['local_port']} --response-file {rpath}
+Restart=on-failure
+RestartSec=2
+User=root
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+""",encoding="utf-8")
+        os.chmod(unit,0o644)
+        run(["systemctl","daemon-reload"],True)
+
+    def deprovision(self, s):
+        run(["systemctl","disable","--now",svc_name('sshws',s['id'])],True)
+        (SYSTEMD_DIR/(svc_name('sshws',s['id'])+".service")).unlink(missing_ok=True)
+        self.response_path(s).unlink(missing_ok=True)
+        run(["systemctl","daemon-reload"],True)
+        delete_account(s["cfg"]["username"])
+
+    def start(self, s):
+        unlock_account(s["cfg"]["username"])
+        return run(["systemctl","enable","--now",svc_name('sshws',s['id'])])
+
+    def stop(self, s):
+        r=run(["systemctl","disable","--now",svc_name('sshws',s['id'])],True)
+        lock_account(s["cfg"]["username"])
+        return r
+
+    def restart(self, s):
+        return run(["systemctl","restart",svc_name('sshws',s['id'])])
+
+    def status(self, s):
+        r=run(["systemctl","is-active",svc_name('sshws',s['id'])],True)
+        return "RUNNING" if r.stdout.strip()=="active" else "STOPPED"
+
+    def summary_rows(self, s):
+        cfg=s["cfg"]
+        return [
+            f"{C.WHITE}Username{C.RESET}      : {cfg['username']}",
+            f"{C.WHITE}Password{C.RESET}      : {'*'*len(cfg['password'])}",
+            f"{C.WHITE}Listen Port{C.RESET}   : {s['port']}  (WebSocket front)",
+            f"{C.WHITE}Local sshd{C.RESET}    : 127.0.0.1:{cfg['local_port']}",
+            f"{C.WHITE}Response File{C.RESET} : {self.response_path(s)}",
+            f"{C.WHITE}Service Unit{C.RESET}  : {svc_name('sshws',s['id'])}.service",
+        ]
+
+    def logs(self, s):
+        subprocess.run(["journalctl","-u",svc_name('sshws',s['id']),"-n","80","-f"])
 
 # ---- Shadowsocks -----------------------------------------------------
 
@@ -589,7 +762,7 @@ WantedBy=multi-user.target
     def logs(self, s):
         subprocess.run(["journalctl","-u",svc_name('xray',s['id']),"-n","80","-f"])
 
-BACKENDS = {b.key: b for b in (MrUdpBackend(), SshBackend(), ShadowsocksBackend(), XrayBackend())}
+BACKENDS = {b.key: b for b in (MrUdpBackend(), SshBackend(), SshWsBackend(), ShadowsocksBackend(), XrayBackend())}
 
 # --------------------------------------------------------------------------
 # one-time migration: the old standalone "vless" backend was merged into the
