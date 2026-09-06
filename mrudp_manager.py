@@ -590,6 +590,49 @@ WantedBy=multi-user.target
         subprocess.run(["journalctl","-u",svc_name('xray',s['id']),"-n","80","-f"])
 
 BACKENDS = {b.key: b for b in (MrUdpBackend(), SshBackend(), ShadowsocksBackend(), XrayBackend())}
+
+# --------------------------------------------------------------------------
+# one-time migration: the old standalone "vless" backend was merged into the
+# unified "xray" backend (which also covers vmess/trojan). Any server saved
+# under the old key is converted in place, its systemd unit/config are
+# regenerated under the new name, and it is restarted if it was running.
+# --------------------------------------------------------------------------
+
+def migrate_legacy_protocols(data):
+    changed=False
+    for s in data:
+        if s.get("protocol")!="vless":
+            continue
+        old=s["cfg"]
+        old_svc=svc_name('vless', s['id'])
+        was_running=run(["systemctl","is-active",old_svc],True).stdout.strip()=="active"
+
+        run(["systemctl","disable","--now",old_svc],True)
+        (SYSTEMD_DIR/(old_svc+".service")).unlink(missing_ok=True)
+        (CFG_DIR/(old_svc+".json")).unlink(missing_ok=True)
+        run(["systemctl","daemon-reload"],True)
+
+        s["protocol"]="xray"
+        s["cfg"]={
+            "inner":"vless",
+            "secret":old.get("uuid") or gen_uuid(),
+            "alter_id":0,
+            "network":old.get("network","tcp"),
+            "path":old.get("ws_path",""),
+            "tls":bool(old.get("tls",False)),
+            "fronted":False,
+            "domain":old.get("domain",""),
+            "sni":old.get("domain",""),
+            "allow_insecure":bool(old.get("tls",False)),
+        }
+        BACKENDS["xray"].provision(s)
+        if was_running:
+            BACKENDS["xray"].start(s)
+        changed=True
+        print(C.YELLOW+f"[MIGRATED] '{s['name']}' converted from vless -> xray backend."+C.RESET)
+    if changed:
+        save(data)
+    return changed
 PROTOCOL_MENU = [(str(i+1), b.label) for i,b in enumerate(BACKENDS.values())]
 PROTOCOL_KEYS = list(BACKENDS.keys())
 
@@ -812,6 +855,7 @@ def main():
     ensure()
     while True:
         data=load()
+        migrate_legacy_protocols(data)
         sync_expired(data)
         clear(); banner()
         running=sum(status(s)[0]=="RUNNING" for s in data)
