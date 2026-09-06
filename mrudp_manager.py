@@ -1014,8 +1014,7 @@ def add_server(data):
     sid=valid_id(name)
     if any(x["id"]==sid for x in data):
         print(C.RED+"[ERROR] This name already exists."+C.RESET); input("Press Enter..."); return
-    default_port=22 if proto_key=="ssh" else 443
-    port=ask_int("Port",default_port)
+    port=ask_int("Port",443,1,65535)
     if port_in_use(data, port):
         print(C.RED+"[ERROR] This port is already used by another server. Choose a different port."+C.RESET)
         input("Press Enter..."); return
