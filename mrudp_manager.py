@@ -327,8 +327,14 @@ def configure_dns(vps_ip):
                 "https://www.duckdns.org/update",
                 {"domains": hostname, "token": token, "ip": vps_ip}
             )
-            if result != "OK":
-                print(C.RED + f"[ERROR] DuckDNS update failed: {result}" + C.RESET)
+
+            # DuckDNS normally returns OK/KO. Keep the exact response visible
+            # so a failed update can be diagnosed instead of hiding it.
+            print(C.YELLOW + f"[DuckDNS] API response: {result!r}" + C.RESET)
+
+            if result.upper() != "OK":
+                print(C.RED + "[ERROR] DuckDNS rejected the update." + C.RESET)
+                print(C.YELLOW + "Check that the token is valid and that this subdomain exists in the same DuckDNS account." + C.RESET)
                 return {"provider": "none", "hostname": ""}
 
             fqdn = f"{hostname}.duckdns.org"
