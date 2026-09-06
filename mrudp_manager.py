@@ -637,7 +637,13 @@ PROTOCOL_MENU = [(str(i+1), b.label) for i,b in enumerate(BACKENDS.values())]
 PROTOCOL_KEYS = list(BACKENDS.keys())
 
 def backend_for(s):
-    return BACKENDS[s["protocol"]]
+    # Backward compatibility: old saved servers may still use legacy keys.
+    proto = str(s.get("protocol", "mrudp")).lower()
+    if proto == "vless":
+        return BACKENDS["xray"]
+    if proto in BACKENDS:
+        return BACKENDS[proto]
+    raise ValueError(f"Unsupported protocol in saved server: {proto}")
 
 # --------------------------------------------------------------------------
 # shared status / expiry
